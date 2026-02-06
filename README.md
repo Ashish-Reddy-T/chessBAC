@@ -23,7 +23,6 @@ BAC2/
 │   ├── train.py                # Training Loop (Loss, Opt, Checkpointing, WandB)
 │   ├── play.py                 # Hybrid Inference Engine (ViT + 1-Ply Search)
 │   └── visualize_attention.py  # Generates attention heatmaps
-├── hpc/                        # SLURM scripts for NYU Greene/Burst
 ├── checkpoints/                # Saved model weights
 ├── README.md
 └── requirements.txt
