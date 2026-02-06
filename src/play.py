@@ -34,16 +34,9 @@ class ChessBot:
         # Helper for board conversion
         self.dataset_helper = ChessDataset(pd.DataFrame({'moves': []}))
 
-    def get_best_move(self, board, temperature=1.0):
+    def get_best_move(self, board, temperature=0.8):
         """
-        Predicts the best legal move for the current board state.
-        
-        Args:
-            board (chess.Board): Current board object.
-            temperature (float): Controls randomness (high = more random).
-            
-        Returns:
-            chess.Move: The selected best move.
+        Hybrid Approach: ViT Intuition + 1-Ply Tactical Search
         """
         # 1. Prepare Input
         board_tensor = self.dataset_helper.board_to_tensor(board).unsqueeze(0).to(self.device)
@@ -54,40 +47,86 @@ class ChessBot:
         
         # 3. Get Legal Moves
         legal_moves = list(board.legal_moves)
-        legal_moves_uci = [m.uci() for m in legal_moves]
         
+        # --- TACTICAL OVERRIDE ---
+        # Before asking the model, check for obvious winning captures (1-Ply Search)
+        # Value mapping: P=1, N=3, B=3.5, R=5, Q=9
+        for move in legal_moves:
+            if board.is_capture(move):
+                # What are we capturing?
+                if board.is_en_passant(move):
+                    captured_piece_val = 1
+                else:
+                    captured_piece = board.piece_at(move.to_square)
+                    if captured_piece:
+                        val_map = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3.5, chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 100}
+                        captured_piece_val = val_map.get(captured_piece.piece_type, 0)
+                        
+                        # If we capture a Queen or Rook free/favorably, DO IT.
+                        # Simple rule: If capture value >= 5 (Rook/Queen), prioritize it.
+                        if captured_piece_val >= 5:
+                            # Verify it's safe? (Too complex for 1-ply, but usually capturing a queen is good)
+                            print(f"Tactical Override: Capturing {captured_piece.symbol()} with {move.uci()}")
+                            return move
+
         # 4. Filter & MaskLogits
-        # Create a tensor of -inf for illegal moves
         masked_logits = torch.full_like(logits, float('-inf'))
-        
         valid_indices = []
+        
         for move in legal_moves:
             uci = move.uci()
             if uci in self.vocab:
                 idx = self.vocab[uci]
                 masked_logits[0, idx] = logits[0, idx]
                 valid_indices.append(idx)
-            else:
-                # If move is legal but NOT in our vocab (rare, but possible if training data missed it),
-                # we can't predict it. 
-                pass
         
-        # Safety Check: If NO legal moves are in vocab (very rare), pick random legal move
-        if len(valid_indices) == 0:
-            print("Warning: No legal moves found in vocabulary! Picking random.")
+        if not valid_indices:
             return random.choice(legal_moves)
             
-        # 5. Softmax & Sampling
+        # 5. Sampling
         probs = F.softmax(masked_logits / temperature, dim=1)
         
-        # Greedy: Pick max probability
-        # best_idx = torch.argmax(probs).item()
+        # Heuristic Safety Check: Don't just blunder pieces immediately
+        # Sample TOP K instead of just 1, and pick the first SAFE one
+        K = 5
+        top_indices = torch.multinomial(probs, K, replacement=True)[0]
         
-        # Sampling: Better for variety and avoiding loops
-        best_idx = torch.multinomial(probs, 1).item()
+        piece_values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 100}
+
+        for idx in top_indices:
+            move_uci = self.vocab_inv[idx.item()]
+            move = chess.Move.from_uci(move_uci)
+            
+            # Safety Check: Are we moving a valuable piece to a square attacked by a pawn/minor?
+            if board.is_capture(move): 
+                return move # Taking things is usually fun/safe-ish in 1-ply logic
+                
+            # Who is moving?
+            my_piece = board.piece_at(move.from_square)
+            if not my_piece: continue # Should not happen
+            my_val = piece_values.get(my_piece.piece_type, 0)
+            
+            # Is the destination attacked by opponent?
+            # board.attackers(color, square)
+            opponent = not board.turn
+            attackers = board.attackers(opponent, move.to_square)
+            
+            is_safe = True
+            for attacker_sq in attackers:
+                attacker_piece = board.piece_at(attacker_sq)
+                atk_val = piece_values.get(attacker_piece.piece_type, 1)
+                
+                # If a pawn (1) attacks my Queen (9), this is BAD.
+                if atk_val < my_val:
+                    is_safe = False
+                    break
+            
+            if is_safe:
+                return move
         
-        best_move_uci = self.vocab_inv[best_idx]
-        return chess.Move.from_uci(best_move_uci)
+        # If all top K moves are unsafe, just panic and play the first one (ViT's top choice)
+        fallback_uci = self.vocab_inv[top_indices[0].item()]
+        return chess.Move.from_uci(fallback_uci)
 
 def play_game():
     """
